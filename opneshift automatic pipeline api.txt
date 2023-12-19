@@ -1,0 +1,196 @@
+def COMMIT_ID
+def PSP_IMAGE_TAG
+def DOCKER_IMAGE_TAG
+def PODMAN_IMAGE_NAME
+def PSP_IMAGE_NAME
+def REPOSITORY_NAME
+def CLUSTER_NAME
+def TASK_NAME
+def SERVICE_NAME
+def MODULE_PATH
+def ARTIFACT_VERSION
+def PSP_IMAGE_ADMIN_TAG
+def PSP_IMAGE_ADMIN_NAME
+def PODMAN_REPO_NAME
+def PSPPUBLIC_IMAGE_NAME
+ 
+pipeline {
+    agent {label "server107"} 
+    parameters {
+        choice(name: 'ENV', choices: ['dev'], description: 'Choose Environment Name')
+        choice(name: 'MODULE', choices: ['onlineadt'], description: 'Choose module to build')
+        string(name: 'BRANCH', defaultValue: 'mer', description: 'Git Branch Name')
+    }
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '10', artifactNumToKeepStr: '10'))
+        timestamps()
+        disableConcurrentBuilds()
+    }
+    environment {
+        DEFAULT_ENV = "dev"
+        DEFAULT_BRANCH = "master"
+        DEFAULT_PROJECT_PREFIX = "PSP"
+        REGION_NAME = "ap-south-1"
+        REPOSITORY_NUMBER = "2041"
+        GIT_CREDENTIAL = "git_pass"
+        GIT_URL = "https://10.21.136.112/onli"
+        OPENSHIFT_YAML_PATH = "/root/onlindmin.yaml"
+        DOCKER_REPO = "default-route-openshift-i.local/dev"
+        PUBLIC_IMAGE_REPO = "image-registry.openshift-i/dev"
+        OPENSHIFT_SERVER = 'api.devocp.psp'
+        PODMAN_SERVER = "defaulpsp.local"
+        OPENSHIFT_TOKEN_CREDS = 'openshift_pass'
+        OPENSHIFT_USER = "psin"
+        KUBECONFIG_PATH = '/rubeconfig'
+    }
+    stages {
+        stage('Cleaning the Workspace') {
+            steps {
+                step([$class: 'WsCleanup'])
+            }
+        }
+
+        stage('Pulling the Repository') {
+            steps {
+                echo "Branch: ${params.BRANCH}"
+                echo "Environment: ${params.ENV}"
+                script {
+                    def BRANCH_NAME = ""
+                    if (params.BRANCH == null || params.BRANCH.equals("null")) {
+                        BRANCH_NAME = "${env.DEFAULT_BRANCH}"
+                    } else {
+                        BRANCH_NAME = "${params.BRANCH}"
+                    }
+                    git branch: "${BRANCH_NAME}", url: "${env.GIT_URL}", changelog: true, poll: true, credentialsId: "${env.GIT_CREDENTIAL}"
+                }
+            }
+        }
+
+        stage('Setting up the Environments') {
+            steps {
+                script {
+                    COMMIT_ID = sh(returnStdout: true, script: "git rev-parse --short HEAD").trim()
+                    println("COMMIT_ID: " + COMMIT_ID)
+                    ARTIFACT_VERSION = "${BUILD_NUMBER}-${COMMIT_ID}"
+ 
+                    REPOSITORY_NAME = "${params.MODULE}"
+                    def IMAGE_NAME = "${env.DOCKER_REPO}/${REPOSITORY_NAME}"
+                    def PUBLIC_IMAGE_NAME = "${env.PUBLIC_IMAGE_REPO}/${REPOSITORY_NAME}"
+                    //def REPO_NAME = "${env.DOCKER_REPO}/${REPOSITORY_NAME}"
+ 
+                    DOCKER_IMAGE_TAG = "${COMMIT_ID}"
+                    PSP_IMAGE_TAG = "${params.ENV}_latest"
+                    //ECS_IMAGE_ADMIN_TAG = "${params.ENV}_admin_latest"
+ 
+                    //PODMAN_IMAGE_NAME = "${IMAGE_NAME}:${DOCKER_IMAGE_TAG}"
+                    PODMAN_IMAGE_NAME = "${REPOSITORY_NAME}:${DOCKER_IMAGE_TAG}"
+                    //PODMAN_REPO_NAME = "${REPO_NAME}:${DOCKER_IMAGE_TAG}"
+                    PSP_IMAGE_NAME = "${IMAGE_NAME}:${DOCKER_IMAGE_TAG}"
+                    PSPPUBLIC_IMAGE_NAME = "${PUBLIC_IMAGE_NAME}:${DOCKER_IMAGE_TAG}"
+                    //PSP_IMAGE_ADMIN_NAME = "${IMAGE_NAME}:${PSP_IMAGE_ADMIN_TAG}"
+ 
+                    CLUSTER_NAME = "${params.ENV}-${env.DEFAULT_PROJECT_PREFIX}"
+                    def PSP_PREFIX = "${params.ENV}-${env.DEFAULT_PROJECT_PREFIX}-${params.MODULE}"
+                    TASK_NAME = "${PSP_PREFIX}"
+                    SERVICE_NAME = "${PSP_PREFIX}"
+                    println("========================================================================")
+                    println("ARTIFACT_VERSION: " + ARTIFACT_VERSION)
+                    println("REPOSITORY_NAME: " + REPOSITORY_NAME)
+                    println("IMAGE_NAME: " + IMAGE_NAME)
+                    println("PODMAN_IMAGE_NAME: " + PODMAN_IMAGE_NAME)
+                    println("PSP_IMAGE_NAME: " + PSP_IMAGE_NAME)
+                    println("PSPPUBLIC_IMAGE_NAME: " + PSPPUBLIC_IMAGE_NAME)
+                    println("CLUSTER_NAME: " + CLUSTER_NAME)
+                    println("TASK_NAME: " + TASK_NAME)
+                    println("SERVICE_NAME: " + SERVICE_NAME)
+                    println("========================================================================")
+ 
+                    if ("${params.MODULE}" == "react") {
+                        MODULE_PATH = "react"
+                    }
+ 
+                    println("MODULE_PATH: " + MODULE_PATH)
+                }
+            }
+        }
+        stage('Building the Artifacts') {
+            steps {
+                script {
+                    sh """#!/bin/bash
+                        set -xe
+                        /usr/share/maven/bin/mvn clean package install
+                        if [ \$? -eq 0 ];
+                        then
+                            echo "Successfully jar build"
+                        else
+                            echo "Error in building jar"
+                            exit 1
+                        fi
+                    """
+                }
+            }
+        }
+        stage('PADMAN Image Push') {
+            steps {
+                script {
+                    sh """
+                        echo "PADMAN Image Push"
+                        echo "current working directory `pwd`"
+                        sudo podman build -f Dockerfile --build-arg artifact_version="${ARTIFACT_VERSION}" -t "${PODMAN_IMAGE_NAME}" .
+                        sudo podman image tag ${PODMAN_IMAGE_NAME} ${PSP_IMAGE_NAME}
+                        sudo podman push ${PSP_IMAGE_NAME}
+
+						sudo podman rmi -f ${PODMAN_IMAGE_NAME}
+						sudo podman rmi -f ${PSP_IMAGE_NAME}
+
+ 
+                        if [ \$? -eq 0 ]
+                        then
+                            echo "Successfully image tagged and pushed to repository"
+                        else
+                            echo "Error in tagging/pushing image"
+                            exit 1
+                        fi
+                    """
+                }
+            }
+        }
+        stage('edit the yamlfile') {
+ 
+            steps {
+ 
+                script {
+ 
+                    // Use grep and awk to extract the old image name from the YAML file
+ 
+                    def oldImageName = sh(script: 'grep "image:" $OPENSHIFT_YAML_PATH | awk \'{print $2}\'', returnStdout: true).trim()
+                    echo "Old Image Name: ${oldImageName}"
+                    echo "NEW Image Name: ${PSPPUBLIC_IMAGE_NAME}"
+                    // Set the extracted old image name as an environment variable for later stages
+ 
+                    env.OLD_Image_Name = oldImageName
+                    env.NEW_Image_Name = PSPPUBLIC_IMAGE_NAME
+                    sh ' sudo sed -i "s|${OLD_Image_Name}|${NEW_Image_Name}|g" $OPENSHIFT_YAML_PATH'
+
+                }
+ 
+            }
+ 
+        }
+        stage('deployed openshift') {
+            steps {
+                script {
+                    // Execute a shell command to copy the kubeconfig file to the workspace
+                    //sh "cp ${KUBECONFIG_PATH} \${WORKSPACE}/kubeconfig"
+
+                    // Print the exported path for reference
+                    //echo "Exported kubeconfig to: \${WORKSPACE}/kubeconfig"
+                    //sh "export KUBECONFIG=\${WORKSPACE}/kubeconfig "
+                    sh "oc apply -f $OPENSHIFT_YAML_PATH "
+                }
+            }
+        }
+
+ 
+    }
+}
